@@ -1,0 +1,112 @@
+#include <Arduino.h>
+#include "ps3_sbdbt.h"
+
+using namespace raven;
+
+// SBDBT = Serial1 (PA9 = TX, PA10 = RX)
+SBDBT sbdbt(PA10_ALT0, PA9_ALT0, 2400);
+
+// DebugSerial = PC11 (RX), PC10 (TX)
+HardwareSerial DebugSerial(PC11_ALT0, PC10_ALT0);
+
+// 前回の状態を保持する構造体
+struct PrevState {
+    int ls_x, ls_y;
+    int rs_x, rs_y;
+
+    uint8_t maru, batu, sikaku, sankaku;
+    uint8_t L1, L2, R1, R2;
+    uint8_t ue, sita, migi, hidari;
+};
+
+PrevState prev = {0};
+
+void setup()
+{
+    DebugSerial.begin(9600);
+    DebugSerial.println("SBDBT driver started (diff update mode).");
+}
+
+void loop()
+{
+    sbdbt.update();
+
+    if (!sbdbt.available()) return;
+
+    // 現在の状態を取得
+    int ls_x = sbdbt.ls_x();
+    int ls_y = sbdbt.ls_y();
+    int rs_x = sbdbt.rs_x();
+    int rs_y = sbdbt.rs_y();
+
+    uint8_t maru    = sbdbt.maru();
+    uint8_t batu    = sbdbt.batu();
+    uint8_t sikaku  = sbdbt.sikaku();
+    uint8_t sankaku = sbdbt.sankaku();
+
+    uint8_t L1 = sbdbt.L1();
+    uint8_t L2 = sbdbt.L2();
+    uint8_t R1 = sbdbt.R1();
+    uint8_t R2 = sbdbt.R2();
+
+    uint8_t ue    = sbdbt.ue();
+    uint8_t sita  = sbdbt.sita();
+    uint8_t migi  = sbdbt.migi();
+    uint8_t hidari= sbdbt.hidari();
+
+    bool changed = false;
+
+    // ===== スティックの変化検出 =====
+    if (ls_x != prev.ls_x || ls_y != prev.ls_y ||
+        rs_x != prev.rs_x || rs_y != prev.rs_y) {
+
+        DebugSerial.print("LS(");
+        DebugSerial.print(ls_x);
+        DebugSerial.print(", ");
+        DebugSerial.print(ls_y);
+        DebugSerial.print(")  RS(");
+        DebugSerial.print(rs_x);
+        DebugSerial.print(", ");
+        DebugSerial.print(rs_y);
+        DebugSerial.println(")");
+
+        changed = true;
+    }
+
+    // ===== ボタンの変化検出 =====
+    auto checkBtn = [&](const char* name, uint8_t now, uint8_t& old){
+        if (now != old) {
+            DebugSerial.print(name);
+            DebugSerial.print(now ? " pressed" : " released");
+            DebugSerial.println();
+            old = now;
+            changed = true;
+        }
+    };
+
+    checkBtn("maru",    maru,    prev.maru);
+    checkBtn("batu",    batu,    prev.batu);
+    checkBtn("sikaku",  sikaku,  prev.sikaku);
+    checkBtn("sankaku", sankaku, prev.sankaku);
+
+    checkBtn("L1", L1, prev.L1);
+    checkBtn("L2", L2, prev.L2);
+    checkBtn("R1", R1, prev.R1);
+    checkBtn("R2", R2, prev.R2);
+
+    checkBtn("ue",    ue,    prev.ue);
+    checkBtn("sita",  sita,  prev.sita);
+    checkBtn("migi",  migi,  prev.migi);
+    checkBtn("hidari",hidari,prev.hidari);
+
+    // ===== 何か変化があったときだけ区切り線を表示 =====
+    if (changed) {
+        DebugSerial.println("-----------------------------");
+    }
+
+    // ===== 最後に前回値を更新 =====
+    prev.ls_x = ls_x;
+    prev.ls_y = ls_y;
+    prev.rs_x = rs_x;
+    prev.rs_y = rs_y;
+}
