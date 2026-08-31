@@ -91,6 +91,9 @@ float theta = 0.0f;  // 中心からのずれ
 float ctrl_abs = 0.0f; // 方角(絶対値)
 float cnt0 = 0.0f, cnt1 = 0.0f;
 float duty0 = 0.0f;
+float omega = 0.0f;
+float omega_filtered = 0.0f; // 慣性フィルタ用
+float straight_gain = 0.0f; // 直進補正用
 
 // ハンド:疑似PWM
 const int INTERVAL = 100;
@@ -107,6 +110,7 @@ void setColor( int state_r, int state_g, int state_b );
 void DigitalArm( float duty0 );
 void armPID( void );
 float mapf(float x, float in_min, float in_max, float out_min, float out_max);
+float expo(float x, float e);
 void setup()
 {
     // DigitalOut
@@ -120,10 +124,8 @@ void setup()
     pinMode(ledRight, OUTPUT);
     pinMode(ledLeft, OUTPUT);
     pinMode(RESET_LED, OUTPUT);
-
     pinMode(arm_A, OUTPUT);
     pinMode(arm_B, OUTPUT);
-
     pinMode(hand_A, OUTPUT);
     pinMode(hand_B, OUTPUT);
 
@@ -146,17 +148,10 @@ void setup()
     DebugSerial.begin(9600);
     DebugSerial.println("SBDBT driver started.");
 
-    // TIM1 を使う（他のタイマーでもOK）
-    timer1 = new HardwareTimer(TIM1);
-
-    // 0.5ms = 500µs 周期
-    timer1->setOverflow(500, MICROSEC_FORMAT);
-
-    // 割り込み関数を登録
-    timer1->attachInterrupt(interrupt_01ms);
-
-    // タイマー開始
-    timer1->resume();
+    timer1 = new HardwareTimer(TIM1); // TIM1をタイマー割込みとして使う
+    timer1->setOverflow(500, MICROSEC_FORMAT); // 0.5ms = 500µs 周期
+    timer1->attachInterrupt(interrupt_01ms); // 割り込み関数を登録
+    timer1->resume();  // タイマー開始
 
     // 足回りモータのpwm周期を125kHzに設定
     pwmTimer->setOverflow(125000, HERTZ_FORMAT);  // 125kHz
@@ -190,6 +185,11 @@ void loop()
     lx = mapf(sbdbt.ls_x(), 0.0f,128.0f, -1.0f,1.0f);
     ly = mapf(sbdbt.ls_y(), 0.0f,128.0f, -1.0f,1.0f);
 
+    // 移動量の指数関数補正
+    lx = expo(lx, 0.45f);   // 左右
+    ly = expo(ly, 0.35f);   // 前後
+    rx = expo(rx, 0.25f);   // 回転
+
     isBoost  = sbdbt.L2();
     isCircle = sbdbt.L1();
     isOpen   = sbdbt.batu();
@@ -213,6 +213,15 @@ void loop()
     if(sbdbt.ls_x() == 64) lx = 0.0f;
     if(sbdbt.ls_y() == 64) ly = 0.0f;
 
+    // 移動量の指数関数補正
+    lx = expo(lx, 0.45f);
+    ly = expo(ly, 0.35f);
+    rx = expo(rx, 0.25f);
+
+    // 直進補正（前進時（lyの絶対値が大きい時）にlxを自動で弱める）
+    straight_gain = 1.0f - fabs(ly);
+    lx *= straight_gain;
+
     // 通常動作の設定
     theta = atan2(lx, ly);
     ctrl_abs = CTRL_GAIN * sqrt(lx*lx + ly*ly);
@@ -220,45 +229,52 @@ void loop()
     cosA = ctrl_abs * cos( 30 * M_PI / 180 - theta);
     cosB = ctrl_abs * cos(150 * M_PI / 180 - theta);
     cosC = ctrl_abs * cos(270 * M_PI / 180 - theta);
-    cosC = (ctrl_abs/CTRL_GAIN)*lx;
+    //cosC = (ctrl_abs/CTRL_GAIN)*lx;
 
     f1 = mapf(cosA, -1.42f, 1.42f,  1.0f, -1.0f);
     f2 = mapf(cosB, -1.42f, 1.42f, -1.0f,  1.0f);
     f3 = mapf(cosC, -1.42f, 1.42f, -1.0f,  1.0f);
 
-    // 右回転
-    if(sbdbt.rs_x() > X_MAX) {
-        f1 = -0.6f;
-        f2 =  0.6f;
-        f3 = -0.6f;
-    }
-    // 左回転
-    else if(sbdbt.rs_x() < X_MIN) {
-        f1 =  0.6f;
-        f2 = -0.6f;
-        f3 =  0.6f;
-    }
+    // 右スティックで回転操作と組み合わせる
+    omega = rx;   // rs_xから得た値
+    omega_filtered = 0.9f * omega_filtered + 0.1f * omega; // 慣性フィルタ
+    f1 += -1.0f*omega_filtered;
+    f2 += omega_filtered;
+    f3 += omega_filtered;
 
     // Boost処理
     if(isBoost) {
-        if(sbdbt.rs_x() > X_MAX) {
-            f1 = -1.0f; f2 = 1.0f; f3 = -1.0f;
+        if(sbdbt.ls_x() > X_MAX) { // 右移動
+            f1 = -1.0f * cos(60*(M_PI/180)); 
+            f2 = 1.0f * cos(60*(M_PI/180)); 
+            f3 = -1.0f;
         }
-        else if(sbdbt.rs_x() < X_MIN) {
-            f1 = 1.0f; f2 = -1.0f; f3 = 1.0f;
+        else if(sbdbt.ls_x() < X_MIN) { // 左移動 
+            f1 = 1.0f * cos(60*(M_PI/180)); 
+            f2 = -1.0f * cos(60*(M_PI/180));
+            f3 = 1.0f;
         }
-        else if(sbdbt.ls_x() > X_MAX) {
-            f1 = -1.0f; f2 = 1.0f; f3 = 1.0f;
+        else if(sbdbt.rs_x() > X_MAX) { // 右回転
+            f1 = -1.0f;
+            f2 = 1.0f;
+            f3 = 1.0f;
         }
-        else if(sbdbt.ls_x() < X_MIN) {
-            f1 = 1.0f; f2 = -1.0f; f3 = -1.0f;
+        else if(sbdbt.rs_x() < X_MIN) { // 左回転
+            f1 = 1.0f;
+            f2 = -1.0f;
+            f3 = -1.0f;
         }
-        else if(sbdbt.ls_y() > Y_MAX) {
-            f1 = -1.0f; f2 = -1.0f; f3 = 0.0f;
+        else if(sbdbt.ls_y() > Y_MAX) { // 前進
+            f1 = -1.0f;
+            f2 = -1.0f; 
+            f3 = 0.0f;
         }
-        else if(sbdbt.ls_y() < Y_MIN) {
-            f1 = 1.0f; f2 = 1.0f; f3 = 0.0f;
+        else if(sbdbt.ls_y() < Y_MIN) { // 後退
+            f1 = 1.0f; 
+            f2 = 1.0f; 
+            f3 = 0.0f;
         }
+        omega *= 2.0f;
     }
 
     // フラグ処理
@@ -266,14 +282,37 @@ void loop()
     coala_flag    = isCoala    ? 1 : 0;
     jimen_flag    = isUnder    ? 1 : 0;
 
-    // アーム先端中心回転
+    // アームの位置を維持したまま足回りだけ動かす
     if(isCircle) {
-        if(sbdbt.ls_x() > X_MAX) {
-            f1 = -0.2f; f2 = 0.2f; f3 = 1.0f;
-        } else if(sbdbt.ls_x() < X_MIN) {
-            f1 = 0.2f; f2 = -0.2f; f3 = -1.0f;
-        }
+
+        // アーム先端固定のための補正回転
+        float omega_fix = lx / 0.55f;   // 550mm = 0.55m
+
+        // 横移動ベクトル（通常の横移動）
+        float vx = lx;
+        float vy = 0.0f;
+
+        float thA = 30.0f * M_PI / 180.0f;
+        float thB = 150.0f * M_PI / 180.0f;
+        float thC = 270.0f * M_PI / 180.0f;
+
+        f1 = lx * cos(thA) + vy * sin(thA);
+        f2 = lx * cos(thB) + vy * sin(thB);
+        f3 = lx * cos(thC) + vy * sin(thC);
+
+        // アーム先端固定のための逆回転成分
+        f1 += -omega_fix;
+        f2 +=  omega_fix;
+        f3 +=  omega_fix;
+
+        DebugSerial.print("f1= ");
+        DebugSerial.print(f1);
+        DebugSerial.print(" f2= ");
+        DebugSerial.print(f2);
+        DebugSerial.print(" f3= ");
+        DebugSerial.println(f3);
     }
+
 
     // ハンド速度調整
     j = INTERVAL - 3;
@@ -467,4 +506,9 @@ void setColor( int state_r, int state_g, int state_b )
 
 float mapf(float x, float in_min, float in_max, float out_min, float out_max){
     return (x - in_min) * (out_max - out_min) / (in_max - in_min) + out_min;
+}
+
+// 移動量の指数関数補正
+float expo(float x, float e) {
+    return x * (e * x * x + (1.0f - e));
 }
