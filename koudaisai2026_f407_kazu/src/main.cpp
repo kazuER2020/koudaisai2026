@@ -9,8 +9,8 @@ using namespace raven;
 
 #define DAIHIHOU_POSITION 510 // 大秘宝を獲得するアームのAD値,ボタン一つでここまで移動させる: 値を上げるとアームが上がる、下げるとアームも下がる
 #define COALA_POSITION 460
-#define ARM_UNDER_LIMIT 460 // アームの最下点
-#define ARM_UPPER_LIMIT 700 // アームの最上点
+#define ARM_UNDER_LIMIT 400 // アームの最下点
+#define ARM_UPPER_LIMIT 658 // アームの最上点
 
 const int OFFSET = 10;
 
@@ -35,21 +35,20 @@ int ledRight   = PE_7;
 int ledLeft    = PE_12;
 int RESET_LED  = PE_4;
 
-int out_A3 = PE_13;
-int out_B3 = PE_14;
+int arm_A = PA_5;   // TIM2_CH1
+int arm_B = PA_3;   // TIM2_CH4
 
-int arm_A = PA_5;
-int arm_B = PA_3;
-
-int hand_A = PD_7;
-int hand_B = PD_4;
+int hand_A = PD_7;  // digitalのみ
+int hand_B = PD_4;  // digitalのみ
 
 int BACKLIGHT = PA_6;
 
-int out_A1 = PC_7;
-int out_A2 = PC_8;
-int out_B1 = PC_6;
-int out_B2 = PC_9;
+int out_A1 = PC_7;  // TIM8_CH2
+int out_A2 = PC_8;  // TIM8_CH3
+int out_B1 = PC_6;  // TIM8_CH1
+int out_B2 = PC_9;  // TIM8_CH4
+int out_A3 = PE_13; // TIM1_CH3
+int out_B3 = PE_14; // TIM1_CH4
 
 int BZ = PB_15;
 
@@ -67,7 +66,7 @@ HardwareSerial DebugSerial(PC11_ALT0, PC10_ALT0);
 
 // 0.5ms割り込み
 HardwareTimer *timer1;
-HardwareTimer *pwmTimer = new HardwareTimer(TIM3);
+HardwareTimer *pwmTimer = new HardwareTimer(TIM8);
 HardwareTimer *pwm1 = new HardwareTimer(TIM1);
 HardwareTimer *pwm2 = new HardwareTimer(TIM2);
 
@@ -83,6 +82,7 @@ unsigned char isOpen = 0, isClose = 0;  // アームの開閉状態
 unsigned char isDaihihou = 0;  // 大秘宝の位置にアームを移動するか
 unsigned char isCoala = 0;
 unsigned char isUnder = 0;  // 地面すれすれに移動
+unsigned char isStop = 0;
 
 float rx = 0.0f, ry = 0.0f, lx = 0.0f, ly = 0.0f;
 float cosA = 0.0f,cosB = 0.0f,cosC = 0.0f;  // 各ホイールとの角度の比
@@ -93,7 +93,11 @@ float cnt0 = 0.0f, cnt1 = 0.0f;
 float duty0 = 0.0f;
 float omega = 0.0f;
 float omega_filtered = 0.0f; // 慣性フィルタ用
-float straight_gain = 0.0f; // 直進補正用
+float straight_gain_x = 0.0f, straight_gain_y = 0.0f; // 直進補正用
+float lx_filtered = 0.0f;
+float ly_filtered = 0.0f;
+static float lpf_state = 0.0f; // AD入力平均化用LPF
+
 
 // ハンド:疑似PWM
 const int INTERVAL = 100;
@@ -111,6 +115,8 @@ void DigitalArm( float duty0 );
 void armPID( void );
 float mapf(float x, float in_min, float in_max, float out_min, float out_max);
 float expo(float x, float e);
+void PwmArm(float pwm);
+unsigned int readAnalogAveraged10bit(int pin);
 void setup()
 {
     // DigitalOut
@@ -147,8 +153,9 @@ void setup()
     pinMode(VR_pin, INPUT_ANALOG);
     DebugSerial.begin(9600);
     DebugSerial.println("SBDBT driver started.");
+    analogReadResolution(10); // analogReadの戻り値を10bitとする
 
-    timer1 = new HardwareTimer(TIM1); // TIM1をタイマー割込みとして使う
+    timer1 = new HardwareTimer(TIM4); // TIM4をタイマー割込みとして使う
     timer1->setOverflow(500, MICROSEC_FORMAT); // 0.5ms = 500µs 周期
     timer1->attachInterrupt(interrupt_01ms); // 割り込み関数を登録
     timer1->resume();  // タイマー開始
@@ -173,22 +180,21 @@ void loop()
     if (!sbdbt.available()) return;
     
     // VR（アナログ入力）
-    now_vri = (analogRead(VR_pin));   // 12bit → 10bit
-    
+    // now_vri = analogRead(VR_pin);   // 10bit
+    now_vri = readAnalogAveraged10bit(VR_pin);
+
     float now_vr = mapf(now_vri, 0, 1023, -1.0f, 1.0f);
     DebugSerial.print("now_vri= ");
-    DebugSerial.println(now_vri);
+    DebugSerial.print(now_vri);
+    DebugSerial.print(", ");
+    DebugSerial.print("now_vr= ");
+    DebugSerial.println(now_vr);
 
     // sbdbt入力（-1.0 ～ +1.0）
     rx = mapf(sbdbt.rs_x(), 0.0f,128.0f, -1.0f,1.0f);
     ry = mapf(sbdbt.rs_y(), 0.0f,128.0f, -1.0f,1.0f);
     lx = mapf(sbdbt.ls_x(), 0.0f,128.0f, -1.0f,1.0f);
     ly = mapf(sbdbt.ls_y(), 0.0f,128.0f, -1.0f,1.0f);
-
-    // 移動量の指数関数補正
-    lx = expo(lx, 0.45f);   // 左右
-    ly = expo(ly, 0.35f);   // 前後
-    rx = expo(rx, 0.25f);   // 回転
 
     isBoost  = sbdbt.L2();
     isCircle = sbdbt.L1();
@@ -217,14 +223,22 @@ void loop()
     lx = expo(lx, 0.45f);
     ly = expo(ly, 0.35f);
     rx = expo(rx, 0.25f);
-
-    // 直進補正（前進時（lyの絶対値が大きい時）にlxを自動で弱める）
-    straight_gain = 1.0f - fabs(ly);
-    lx *= straight_gain;
-
+    
     // 通常動作の設定
-    theta = atan2(lx, ly);
-    ctrl_abs = CTRL_GAIN * sqrt(lx*lx + ly*ly);
+    // 直進前後補正（前進後退時（lyの絶対値が大きい時）にlxを自動で弱める）
+    straight_gain_x = 1.0f - fabs(ly);
+    lx *= straight_gain_x;
+    lx_filtered = 0.85f * lx_filtered + 0.15f * lx; //  横移動を滑らかにするフィルタ
+
+    // 直進左右補正（左右移動時（lxの絶対値が大きい時）にlyを自動で弱める）
+    straight_gain_y = 1.0f - fabs(lx);
+    ly *= straight_gain_y;
+    ly_filtered = 0.85f * ly_filtered + 0.15f * ly; //  縦移動を滑らかにするフィルタ
+
+    // theta = atan2(lx, ly);
+    //ctrl_abs = CTRL_GAIN * sqrt(lx*lx + ly*ly);
+    theta = atan2(lx_filtered, ly_filtered); // 補正後の値を使う
+    ctrl_abs = CTRL_GAIN * sqrt(lx_filtered*lx_filtered + ly_filtered*ly_filtered); // 補正後の値を使う
 
     cosA = ctrl_abs * cos( 30 * M_PI / 180 - theta);
     cosB = ctrl_abs * cos(150 * M_PI / 180 - theta);
@@ -234,15 +248,16 @@ void loop()
     f1 = mapf(cosA, -1.42f, 1.42f,  1.0f, -1.0f);
     f2 = mapf(cosB, -1.42f, 1.42f, -1.0f,  1.0f);
     f3 = mapf(cosC, -1.42f, 1.42f, -1.0f,  1.0f);
-
+ 
     // 右スティックで回転操作と組み合わせる
     omega = rx;   // rs_xから得た値
-    omega_filtered = 0.9f * omega_filtered + 0.1f * omega; // 慣性フィルタ
+    omega_filtered = 0.85f * omega_filtered + 0.15f * omega; // 慣性フィルタ
     f1 += -1.0f*omega_filtered;
     f2 += omega_filtered;
     f3 += omega_filtered;
 
     // Boost処理
+    /*
     if(isBoost) {
         if(sbdbt.ls_x() > X_MAX) { // 右移動
             f1 = -1.0f * cos(60*(M_PI/180)); 
@@ -276,43 +291,31 @@ void loop()
         }
         omega *= 2.0f;
     }
+    */
 
     // フラグ処理
     daihihou_flag = isDaihihou ? 1 : 0;
     coala_flag    = isCoala    ? 1 : 0;
     jimen_flag    = isUnder    ? 1 : 0;
 
-    // アームの位置を維持したまま足回りだけ動かす
-    if(isCircle) {
+    if(isCircle){
+        float corr = lx_filtered * 0.1f;
+        // 左右判定を角度で行う
+        float angle = atan2(ly_filtered, lx_filtered);  // -180°〜+180°
 
-        // アーム先端固定のための補正回転
-        float omega_fix = lx / 0.55f;   // 550mm = 0.55m
-
-        // 横移動ベクトル（通常の横移動）
-        float vx = lx;
-        float vy = 0.0f;
-
-        float thA = 30.0f * M_PI / 180.0f;
-        float thB = 150.0f * M_PI / 180.0f;
-        float thC = 270.0f * M_PI / 180.0f;
-
-        f1 = lx * cos(thA) + vy * sin(thA);
-        f2 = lx * cos(thB) + vy * sin(thB);
-        f3 = lx * cos(thC) + vy * sin(thC);
-
-        // アーム先端固定のための逆回転成分
-        f1 += -omega_fix;
-        f2 +=  omega_fix;
-        f3 +=  omega_fix;
-
-        DebugSerial.print("f1= ");
-        DebugSerial.print(f1);
-        DebugSerial.print(" f2= ");
-        DebugSerial.print(f2);
-        DebugSerial.print(" f3= ");
-        DebugSerial.println(f3);
+        // 右方向（角度が -45°〜+45°）
+        if(angle > -0.785f && angle < 0.785f){
+            f3 = -fabs(lx_filtered);   // motor3(-f3) → +main
+            f1 = -fabs(corr);
+            f2 =  fabs(corr);
+        }
+        // 左方向（角度が 135°〜180° または -180°〜-135°）
+        else if(angle > 2.356f || angle < -2.356f){
+            f3 =  fabs(lx_filtered);   // motor3(-f3) → -main
+            f1 =  fabs(corr);
+            f2 = -fabs(corr);
+        }
     }
-
 
     // ハンド速度調整
     j = INTERVAL - 3;
@@ -333,8 +336,9 @@ void loop()
     motor3(-1.0f * f3);
 
     // アーム動作
-    armPID();
-    DigitalArm(ry);
+    //armPID();
+    // DigitalArm(ry);
+    PwmArm(ry);
 }
 
 
@@ -420,82 +424,123 @@ void motor3(float pwm)
     analogWrite(out_B3, (1.0f - duty) * 255); // PE14 → TIM1_CH4
 }
 
-
-void armPID(void)
+// アームをPWMで動かす。入力はジョイスティックrx座標
+void PwmArm(float pwm)
 {
-    // 大秘宝位置へ強制移動
+    const float DEADZONE   = 0.05f;
+    const float INPUT_LPF  = 0.20f;
+    const float PWM_LPF    = 0.25f;
+    const float SLEW_RATE  = 0.05f;
+
+    static float ry_filtered = 0.0f;
+    static float pwm_smooth  = 0.0f;
+    static float pwm_final   = 0.0f;
+
+    // ============================================================
+    // 自動位置移動　P制御
+    // ============================================================
     if(daihihou_flag == 1) {
-        if(now_vri < (DAIHIHOU_POSITION + OFFSET)) {
-            ry = 1.0f;
-        } else if(now_vri > (DAIHIHOU_POSITION - OFFSET)) {
-            ry = -1.0f;
-        } else {
-            ry = 0.0f;
-            daihihou_flag = 0;
-        }
+        if(now_vri < (DAIHIHOU_POSITION - OFFSET)) pwm = 1.0f;
+        else if(now_vri > (DAIHIHOU_POSITION + OFFSET)) pwm = -1.0f;
+        else { pwm = 0.0f; daihihou_flag = 0; }
     }
 
-    // コアラ位置へ強制移動
     if(coala_flag == 1) {
-        if(now_vri < (COALA_POSITION + OFFSET)) {
-            ry = 1.0f;
-        } else if(now_vri > (COALA_POSITION - OFFSET)) {
-            ry = -1.0f;
-        } else {
-            ry = 0.0f;
-            coala_flag = 0;
-        }
+        if(now_vri < (COALA_POSITION - OFFSET)) pwm = 1.0f;
+        else if(now_vri > (COALA_POSITION + OFFSET)) pwm = -1.0f;
+        else { pwm = 0.0f; coala_flag = 0; }
     }
 
-    // 地面位置へ強制移動
     if(jimen_flag == 1) {
-        if(now_vri < (ARM_UNDER_LIMIT + OFFSET)) {
-            ry = 1.0f;
-        } else if(now_vri > (ARM_UNDER_LIMIT - OFFSET)) {
-            ry = -1.0f;
-        } else {
-            ry = 0.0f;
-            jimen_flag = 0;
-        }
-    }
-}
-void DigitalArm(float duty0)
-{
-    if(duty0 <= -1.0f) duty0 = -0.99f;
-    if(duty0 >=  1.0f) duty0 =  0.99f;
-
-    if(now_vri <= ARM_UNDER_LIMIT && !isCoala && !isDaihihou) {
-        DebugSerial.println("!!!UNDER LIMIT!!!");
-        if(duty0 > 0){
-            analogWrite(arm_A, 0);
-            analogWrite(arm_B, 0);
-            return;
-        }
-    }
-    if(now_vri >= ARM_UPPER_LIMIT && !isCoala && !isDaihihou) {
-        DebugSerial.println("!!!UNDER LIMIT!!!");
-        if(duty0 < 0){
-            analogWrite(arm_A, 0);
-            analogWrite(arm_B, 0);
-            return;
-        }
+        if(now_vri < (ARM_UNDER_LIMIT - OFFSET)) pwm = 1.0f;
+        else if(now_vri > (ARM_UNDER_LIMIT + OFFSET)) pwm = -1.0f;
+        else { pwm = 0.0f; jimen_flag = 0; }
     }
 
-    if(duty0 > 0.0f) {
-        float duty = duty0;
+    // ============================================================
+    // ジョイスティック入力のLPF
+    // ============================================================
+    float prev_filtered = ry_filtered;
+    ry_filtered = (1.0f - INPUT_LPF) * ry_filtered + INPUT_LPF * pwm;
+
+    // ============================================================
+    // 方向反転時はフィルタ即リセット
+    // ============================================================
+    if((prev_filtered > 0 && ry_filtered < 0) ||
+       (prev_filtered < 0 && ry_filtered > 0))
+    {
+        pwm_smooth = ry_filtered;
+        pwm_final  = ry_filtered;
+    }
+
+    // ============================================================
+    // ジョイスティックが離されている場合は完全停止
+    // ============================================================
+    if(fabs(ry_filtered) < DEADZONE) {
+        ry_filtered = 0.0f;
+        pwm_smooth  = 0.0f;
+        pwm_final   = 0.0f;
         analogWrite(arm_A, 0);
-        analogWrite(arm_B, duty * 255);
-    }
-    else if(duty0 < 0.0f) {
-        float duty = fabs(duty0);
-        analogWrite(arm_A, duty * 255);
         analogWrite(arm_B, 0);
+        return;
     }
-    else {
+
+    // ============================================================
+    // 機構限界保護
+    // ============================================================
+    bool isAuto = (daihihou_flag || coala_flag || jimen_flag);
+
+    if(now_vri <= ARM_UNDER_LIMIT && !isAuto) {
+        if(ry_filtered < 0) {
+            ry_filtered = 0.0f;
+            pwm_smooth  = 0.0f;
+            pwm_final   = 0.0f;
+        }
+    }
+
+    if(now_vri >= ARM_UPPER_LIMIT && !isAuto) {
+        if(ry_filtered > 0) {
+            ry_filtered = 0.0f;
+            pwm_smooth  = 0.0f;
+            pwm_final   = 0.0f;
+        }
+    }
+
+    // ============================================================
+    // ⑥ 加速度制限
+    // ============================================================
+    float diff = ry_filtered - pwm_smooth;
+    if(diff > SLEW_RATE) diff = SLEW_RATE;
+    if(diff < -SLEW_RATE) diff = -SLEW_RATE;
+    pwm_smooth += diff;
+
+    // ============================================================
+    // ⑦ PWMフィルタ
+    // ============================================================
+    pwm_final = (1.0f - PWM_LPF) * pwm_final + PWM_LPF * pwm_smooth;
+
+    // ============================================================
+    // ⑧ ★初動逆方向防止：pwm_final が ±0.10 未満なら完全停止
+    // ============================================================
+    if(fabs(pwm_final) < 0.10f) {
         analogWrite(arm_A, 0);
         analogWrite(arm_B, 0);
+        return;
     }
+
+    // ============================================================
+    // ⑨ PWM駆動（mbed互換）
+    // ============================================================
+    float duty = mapf(pwm_final, -1.0f, 1.0f, 0.0f, 1.0f);
+
+    if(duty >= 1.0f) duty = 0.95f;
+    if(duty <= 0.0f) duty = 0.01f;
+
+    analogWrite(arm_B, duty * 255);
+    analogWrite(arm_A, (1.0f - duty) * 255);
 }
+
+
 
 void setColor( int state_r, int state_g, int state_b )
 {
@@ -511,4 +556,42 @@ float mapf(float x, float in_min, float in_max, float out_min, float out_max){
 // 移動量の指数関数補正
 float expo(float x, float e) {
     return x * (e * x * x + (1.0f - e));
+}
+
+inline unsigned int median3(unsigned int a, unsigned int b, unsigned int c)
+{
+    if(a > b) { unsigned int t = a; a = b; b = t; }
+    if(b > c) { unsigned int t = b; b = c; c = t; }
+    if(a > b) { unsigned int t = a; a = b; b = t; }
+    return b;   // 中央値
+}
+
+// アナログ入力を複数回サンプリングして平均化する
+unsigned int readAnalogAveraged10bit(int pin)
+{
+    const int SAMPLE_COUNT = 32;
+    unsigned int sum = 0;
+
+    // ① 32回サンプリング（10bit）
+    for(int i = 0; i < SAMPLE_COUNT; i++) {
+
+        // 3点中央値フィルタで突発ノイズを除去
+        unsigned int a = analogRead(pin);
+        unsigned int b = analogRead(pin);
+        unsigned int c = analogRead(pin);
+        unsigned int med = median3(a, b, c);
+        sum += med;
+    }
+
+    // 平均化
+    unsigned int avg = sum / SAMPLE_COUNT;
+
+    // LPF
+    lpf_state = 0.90f * lpf_state + 0.10f * avg;
+
+    // 0〜1023にまるめる
+    if(lpf_state < 0.0f)   lpf_state = 0.0f;
+    if(lpf_state > 1023.0f) lpf_state = 1023.0f;
+
+    return (unsigned int)(lpf_state + 0.5f);
 }
