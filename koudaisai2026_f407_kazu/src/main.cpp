@@ -9,7 +9,7 @@ using namespace raven;
 
 #define DAIHIHOU_POSITION 510 // 大秘宝を獲得するアームのAD値,ボタン一つでここまで移動させる: 値を上げるとアームが上がる、下げるとアームも下がる
 #define COALA_POSITION 460
-#define ARM_UNDER_LIMIT 400 // アームの最下点
+#define ARM_UNDER_LIMIT 390 // アームの最下点
 #define ARM_UPPER_LIMIT 658 // アームの最上点
 
 const int OFFSET = 10;
@@ -84,6 +84,8 @@ unsigned char isCoala = 0;
 unsigned char isUnder = 0;  // 地面すれすれに移動
 unsigned char isStop = 0;
 
+unsigned char isArmLimit = 0; // 1:機構限界到達
+
 float rx = 0.0f, ry = 0.0f, lx = 0.0f, ly = 0.0f;
 float cosA = 0.0f,cosB = 0.0f,cosC = 0.0f;  // 各ホイールとの角度の比
 float f1 = 0.0f, f2 = 0.0f, f3 = 0.0f;  // モータにかける最終pwm
@@ -97,6 +99,8 @@ float straight_gain_x = 0.0f, straight_gain_y = 0.0f; // 直進補正用
 float lx_filtered = 0.0f;
 float ly_filtered = 0.0f;
 static float lpf_state = 0.0f; // AD入力平均化用LPF
+static float arm_cmd_filtered = 0.0f;
+// アームの動作を滑らかにするためのLPF状態（-1.0〜1.0、0.0=停止）
 
 
 // ハンド:疑似PWM
@@ -424,122 +428,63 @@ void motor3(float pwm)
     analogWrite(out_B3, (1.0f - duty) * 255); // PE14 → TIM1_CH4
 }
 
-// アームをPWMで動かす。入力はジョイスティックrx座標
+// アームをPWMで動かす。入力はジョイスティックry座標
 void PwmArm(float pwm)
 {
-    const float DEADZONE   = 0.05f;
-    const float INPUT_LPF  = 0.20f;
-    const float PWM_LPF    = 0.25f;
-    const float SLEW_RATE  = 0.05f;
+    const float DEADZONE    = 0.08f; // 不感帯：この範囲内はスティック中央とみなす
+    const float EXPO_FACTOR = 0.50f; // 指数関数補正：中央付近を繊細に操作できるようにする
+    const float LPF_ALPHA   = 0.30f; // ローパスフィルタ係数：小さいほど滑らか、大きいほど機敏
+    const float STOP_EPS    = 0.02f; // このコマンド値未満なら完全停止とみなす
 
-    static float ry_filtered = 0.0f;
-    static float pwm_smooth  = 0.0f;
-    static float pwm_final   = 0.0f;
+    // 1) 不感帯処理
+    float input = pwm;
+    if (fabs(input) < DEADZONE) input = 0.0f;
 
-    // ============================================================
-    // 自動位置移動　P制御
-    // ============================================================
-    if(daihihou_flag == 1) {
-        if(now_vri < (DAIHIHOU_POSITION - OFFSET)) pwm = 1.0f;
-        else if(now_vri > (DAIHIHOU_POSITION + OFFSET)) pwm = -1.0f;
-        else { pwm = 0.0f; daihihou_flag = 0; }
-    }
+    // 2) 指数関数補正
+    input = expo(input, EXPO_FACTOR);
 
-    if(coala_flag == 1) {
-        if(now_vri < (COALA_POSITION - OFFSET)) pwm = 1.0f;
-        else if(now_vri > (COALA_POSITION + OFFSET)) pwm = -1.0f;
-        else { pwm = 0.0f; coala_flag = 0; }
-    }
+    // 3) コマンド値そのものにLPFを掛ける（duty換算は最後に行う）
+    arm_cmd_filtered = (1.0f - LPF_ALPHA) * arm_cmd_filtered + LPF_ALPHA * input;
 
-    if(jimen_flag == 1) {
-        if(now_vri < (ARM_UNDER_LIMIT - OFFSET)) pwm = 1.0f;
-        else if(now_vri > (ARM_UNDER_LIMIT + OFFSET)) pwm = -1.0f;
-        else { pwm = 0.0f; jimen_flag = 0; }
-    }
-
-    // ============================================================
-    // ジョイスティック入力のLPF
-    // ============================================================
-    float prev_filtered = ry_filtered;
-    ry_filtered = (1.0f - INPUT_LPF) * ry_filtered + INPUT_LPF * pwm;
-
-    // ============================================================
-    // 方向反転時はフィルタ即リセット
-    // ============================================================
-    if((prev_filtered > 0 && ry_filtered < 0) ||
-       (prev_filtered < 0 && ry_filtered > 0))
-    {
-        pwm_smooth = ry_filtered;
-        pwm_final  = ry_filtered;
-    }
-
-    // ============================================================
-    // ジョイスティックが離されている場合は完全停止
-    // ============================================================
-    if(fabs(ry_filtered) < DEADZONE) {
-        ry_filtered = 0.0f;
-        pwm_smooth  = 0.0f;
-        pwm_final   = 0.0f;
+    // 4) スティックが中央 かつ フィルタ値も十分小さければ完全停止
+    //    （元のコードと同じく、両ピンに真の0を出力する）
+    if (input == 0.0f && fabs(arm_cmd_filtered) < STOP_EPS) {
+        arm_cmd_filtered = 0.0f; // 残留誤差をクリアして次回の応答性を保つ
         analogWrite(arm_A, 0);
         analogWrite(arm_B, 0);
         return;
     }
 
-    // ============================================================
-    // 機構限界保護
-    // ============================================================
-    bool isAuto = (daihihou_flag || coala_flag || jimen_flag);
+    // 5) 目標デューティに変換して出力
+    float duty = mapf(arm_cmd_filtered, -1.0f, 1.0f, 0.0f, 1.0f);
 
-    if(now_vri <= ARM_UNDER_LIMIT && !isAuto) {
-        if(ry_filtered < 0) {
-            ry_filtered = 0.0f;
-            pwm_smooth  = 0.0f;
-            pwm_final   = 0.0f;
+    if (duty >= 1.0f) duty = 0.95f;
+    if (duty <= 0.0f) duty = 0.01f;
+    now_vri = analogRead(VR_pin);
+
+    if(now_vri < ARM_UNDER_LIMIT ){ // 下側の機構限界に到達状態
+        if(duty > 0.5f) {
+            duty = 0.5f;
+            arm_cmd_filtered = 0.0f;
+        }
+    }
+    if(now_vri > ARM_UPPER_LIMIT ){ // 上側の機構限界に到達状態
+        if(duty < 0.5f){
+            duty = 0.5f;
+            arm_cmd_filtered = 0.0f;
         }
     }
 
-    if(now_vri >= ARM_UPPER_LIMIT && !isAuto) {
-        if(ry_filtered > 0) {
-            ry_filtered = 0.0f;
-            pwm_smooth  = 0.0f;
-            pwm_final   = 0.0f;
-        }
-    }
 
-    // ============================================================
-    // ⑥ 加速度制限
-    // ============================================================
-    float diff = ry_filtered - pwm_smooth;
-    if(diff > SLEW_RATE) diff = SLEW_RATE;
-    if(diff < -SLEW_RATE) diff = -SLEW_RATE;
-    pwm_smooth += diff;
-
-    // ============================================================
-    // ⑦ PWMフィルタ
-    // ============================================================
-    pwm_final = (1.0f - PWM_LPF) * pwm_final + PWM_LPF * pwm_smooth;
-
-    // ============================================================
-    // ⑧ ★初動逆方向防止：pwm_final が ±0.10 未満なら完全停止
-    // ============================================================
-    if(fabs(pwm_final) < 0.10f) {
-        analogWrite(arm_A, 0);
+    if((duty > 0.45f && duty < 0.55f)  && arm_cmd_filtered==0.0f){
         analogWrite(arm_B, 0);
-        return;
+        analogWrite(arm_A, 0);
     }
-
-    // ============================================================
-    // ⑨ PWM駆動（mbed互換）
-    // ============================================================
-    float duty = mapf(pwm_final, -1.0f, 1.0f, 0.0f, 1.0f);
-
-    if(duty >= 1.0f) duty = 0.95f;
-    if(duty <= 0.0f) duty = 0.01f;
-
-    analogWrite(arm_B, duty * 255);
-    analogWrite(arm_A, (1.0f - duty) * 255);
+    else{
+        analogWrite(arm_B, duty * 255);
+        analogWrite(arm_A, (1.0f - duty) * 255); 
+    }
 }
-
 
 
 void setColor( int state_r, int state_g, int state_b )
