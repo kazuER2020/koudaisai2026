@@ -14,8 +14,8 @@ using namespace raven;
 #define ARM_UNDER_LIMIT 405 // アームの最下点
 #define ARM_UPPER_LIMIT 640 // アームの最上点
 
-#define HAND_RELEASE_SPEED  0.85f // ハンド開放強さ
-#define HAND_HOLD_SPEED     0.65f // ハンド保持強さ
+#define HAND_RELEASE_SPEED  0.40f // ハンド開放強さ
+#define HAND_HOLD_SPEED     0.60f // ハンド保持強さ
 
 /* PS3 joystick limits defination: */
 #define X_MAX 100
@@ -83,14 +83,17 @@ int jimen_flag = 0;  // 1にするとアーム位置を地面に強制移動
 int now_vri = 0;  // VRの現在位置(AD)
 
 unsigned char isYobikomi = 0;
-unsigned char isCircle = 0;
+unsigned char isArmLimit = 0; // アームの機構限界
+unsigned char isCircle = 0; // アーム中心軸で動作状態
 unsigned char isOpen = 0, isClose = 0;  // アームの開閉状態
 unsigned char isDaihihou = 0;  // 大秘宝の位置にアームを移動するか
 unsigned char isCoala = 0;
 unsigned char isUnder = 0;  // 地面すれすれに移動
-unsigned char isStop = 0;
 unsigned char is1st = 0; // 1段目212mm目標のad値
 unsigned char is2nd = 0; // 2段目524mm目標のad値
+unsigned char isWheelMoving = 0; // オムニ動作中か
+unsigned char isArmMoving = 0; // アーム部の動作中か
+unsigned char raspiBuffer = 0; // ラズパイへ送信用バッファ
 
 float rx = 0.0f, ry = 0.0f, lx = 0.0f, ly = 0.0f;
 float cosA = 0.0f,cosB = 0.0f,cosC = 0.0f;  // 各ホイールとの角度の比
@@ -131,6 +134,7 @@ void ArmGoToPosition(int target_ad);
 void famima( int bpm );
 void yobikomi_No4(int bpm);
 void toneSTM(float freq, int bpm, float note);
+unsigned char sendRasipSerial(void);
 
 void setup()
 {
@@ -167,7 +171,7 @@ void setup()
     // AnalogIn
     pinMode(VR_pin, INPUT_ANALOG);
     DebugSerial.begin(9600);
-    DebugSerial.println("SBDBT driver started.");
+    // DebugSerial.println("SBDBT driver started.");
     analogReadResolution(10); // analogReadの戻り値を10bitとする
 
     timer1 = new HardwareTimer(TIM4); // TIM4をタイマー割込みとして使う
@@ -203,7 +207,6 @@ void setup()
     toneSTM(0,    bpm, 0.07);
 
 #endif  // FAMIMA
-
     cnt0 = 0;
     cnt1 = 0;
 }
@@ -220,11 +223,11 @@ void loop()
     now_vri = readAnalogAveraged10bit(VR_pin);
 
     float now_vr = mapf(now_vri, 0, 1023, -1.0f, 1.0f);
-    DebugSerial.print("now_vri= ");
-    DebugSerial.print(now_vri);
-    DebugSerial.print(", ");
-    DebugSerial.print("now_vr= ");
-    DebugSerial.println(now_vr);
+    //DebugSerial.print("now_vri= ");
+    //DebugSerial.print(now_vri);
+    //DebugSerial.print(", ");
+    //DebugSerial.print("now_vr= ");
+    //DebugSerial.println(now_vr);
 
     // sbdbt入力（-1.0 ～ +1.0）
     rx = mapf(sbdbt.rs_x(), 0.0f,128.0f, -1.0f,1.0f);
@@ -257,6 +260,22 @@ void loop()
     if(sbdbt.ls_x() == 64) lx = 0.0f;
     if(sbdbt.ls_y() == 64) ly = 0.0f;
 
+    // 左ジョイスティック
+    if(lx == 0.0f && ly == 0.0f ){ // オムニ足回り停止中
+        isWheelMoving = 0;
+    }
+    if((lx == 0.0f && ly != 0.0f) || (lx != 0.0f && ly == 0.0f) || (rx != 0.0f)){ // オムニ足回りが動いているとき
+        isWheelMoving = 1;
+    }
+
+    // 右ジョイスティック
+    if(ry == 0.0f || isArmLimit == 1){ // アーム停止中
+        isArmMoving = 0;
+    }
+    else{ // アームが動作中
+        isArmMoving = 1;
+    }
+
     // 移動量の指数関数補正
     lx = expo(lx, 0.45f);
     ly = expo(ly, 0.35f);
@@ -272,6 +291,7 @@ void loop()
     straight_gain_y = 1.0f - fabs(lx);
     ly *= straight_gain_y;
     ly_filtered = 0.85f * ly_filtered + 0.15f * ly;
+
     theta = atan2(lx_filtered, ly_filtered);
     ctrl_abs = CTRL_GAIN * sqrt(lx_filtered*lx_filtered + ly_filtered*ly_filtered);
 
@@ -294,6 +314,7 @@ void loop()
     coala_flag    = isCoala    ? 1 : 0;
     jimen_flag    = isUnder    ? 1 : 0;
     
+    /*
     if(isYobikomi){
         motor1(0);
         motor2(0);
@@ -303,6 +324,7 @@ void loop()
         yobikomi_No4(130);
         isYobikomi = 0;
     }
+    */
 
 
     if(isCircle){
@@ -366,6 +388,10 @@ void loop()
     else {
         PwmArm(ry); // 通常のジョイスティック操作
     }
+    // ラズパイへシリアル通信でロボットの動作状態を通知
+    raspiBuffer = sendRasipSerial();
+    DebugSerial.println(raspiBuffer);
+        
 
 }
 
@@ -474,28 +500,30 @@ void PwmArm(float pwm)
 
     if (pwm == 0.0f) {
         duty = 0.5f;
-        } else {
-            duty = mapf(pwm, -1.0f, 1.0f, 0.0f, 1.0f);
-             // 機構下限に到達
-            if(now_vri < ARM_UNDER_LIMIT){
-                if(duty>0.5f){
-                    pwm=0.0f;
-                    analogWrite(arm_A, 0);
-                    analogWrite(arm_B, 0);
-                    return;  
-                }    
+    } else {
+        duty = mapf(pwm, -1.0f, 1.0f, 0.0f, 1.0f);
+         // 機構下限に到達
+        if(now_vri < ARM_UNDER_LIMIT){
+            if(duty>0.5f){
+                pwm=0.0f;
+                analogWrite(arm_A, 0);
+                analogWrite(arm_B, 0);
+                isArmLimit = 1;
+                return;  
+            }    
+        }
+        // 機構上限に到達
+        if(now_vri > ARM_UPPER_LIMIT){
+            if(duty<0.5f){
+                pwm=0.0f;
+                analogWrite(arm_A, 0);
+                analogWrite(arm_B, 0);
+                isArmLimit = 1;
+                return;  
             }
-            // 機構上限に到達
-            if(now_vri > ARM_UPPER_LIMIT){
-                if(duty<0.5f){
-                    pwm=0.0f;
-                    analogWrite(arm_A, 0);
-                    analogWrite(arm_B, 0);
-                    return;  
-                }
-            }
+        }
     }
-
+    isArmLimit = 0;
     if (duty >= 1.0f) duty = 0.95f;
     if (duty <= 0.0f) duty = 0.01f;
 
@@ -904,4 +932,48 @@ void yobikomi_No4(int bpm) {
 
     // 最後に消灯
     setColor(LOW, LOW, LOW);
+}
+
+// ============================================================
+// ラズパイへ USBシリアル通信でロボット状態を1byte通知する関数
+// ------------------------------------------------------------
+// 送信フォーマット（1 byte = 8bit）
+//   bit0 (0x01): オムニ走行中       → isWheelMoving
+//   bit1 (0x02): アーム動作中       → isArmMoving / is1st / is2nd / isDaihihou / isCoala / isUnder
+//   bit2 (0x04): ハンド開閉動作     → isOpen / isClose
+//   bit3 (0x08): ハンド中心軸動作   → isCircle
+//   bit4 (0x10): 呼び込み君動作     → isYobikomi
+//
+// 例:
+//   0b00000001 = オムニのみ動作
+//   0b00000110 = アーム + ハンド動作
+//   0b00011111 = 全アクチュエータ動作
+//
+// ラズパイ側では受信した1byteをビット演算で解析する
+// ============================================================
+
+unsigned char sendRasipSerial(void){
+    unsigned char ret = 0;
+
+    // bit0: オムニ走行
+    if(isWheelMoving)
+        ret |= 0x01;
+
+    // bit1: アーム動作
+    if(isArmMoving || is1st || is2nd || isDaihihou || isCoala || isUnder)
+        ret |= 0x02;
+
+    // bit2: ハンド開閉
+    if(isOpen || isClose)
+        ret |= 0x04;
+
+    // bit3: ハンド中心軸
+    if(isCircle)
+        ret |= 0x08;
+
+    // bit4: 呼び込み君
+    if(isYobikomi)
+        ret |= 0x10;
+
+    return ret;
 }
