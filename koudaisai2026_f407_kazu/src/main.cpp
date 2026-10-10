@@ -14,8 +14,8 @@ using namespace raven;
 #define ARM_UNDER_LIMIT 405 // アームの最下点
 #define ARM_UPPER_LIMIT 640 // アームの最上点
 
-#define HAND_RELEASE_SPEED  0.40f // ハンド開放強さ
-#define HAND_HOLD_SPEED     0.60f // ハンド保持強さ
+#define HAND_RELEASE_SPEED  0.45f // ハンド開放強さ
+#define HAND_HOLD_SPEED     0.70f // ハンド保持強さ
 
 /* PS3 joystick limits defination: */
 #define X_MAX 100
@@ -277,9 +277,9 @@ void loop()
     }
 
     // 移動量の指数関数補正
-    lx = expo(lx, 0.45f);
-    ly = expo(ly, 0.35f);
-    rx = expo(rx, 0.25f);
+    lx = expo(lx, 0.5f);
+    ly = expo(ly, 0.5f);
+    rx = expo(rx, 0.5f);
     
     // 通常動作の設定
     // 直進前後補正（前進後退時（lyの絶対値が大きい時）にlxを自動で弱める）
@@ -940,8 +940,8 @@ void yobikomi_No4(int bpm) {
 // 送信フォーマット（1 byte = 8bit）
 //   bit0 (0x01): オムニ走行中       → isWheelMoving
 //   bit1 (0x02): アーム動作中       → isArmMoving / is1st / is2nd / isDaihihou / isCoala / isUnder
-//   bit2 (0x04): ハンド開閉動作     → isOpen / isClose
-//   bit3 (0x08): ハンド中心軸動作   → isCircle
+//   bit2 (0x04): ハンド開動作 　    → isOpen
+//   bit3 (0x08): ハンド閉動作　　   → isClose
 //   bit4 (0x10): 呼び込み君動作     → isYobikomi
 //
 // 例:
@@ -963,12 +963,12 @@ unsigned char sendRasipSerial(void){
     if(isArmMoving || is1st || is2nd || isDaihihou || isCoala || isUnder)
         ret |= 0x02;
 
-    // bit2: ハンド開閉
-    if(isOpen || isClose)
+    // bit2: ハンド閉
+    if(isClose)
         ret |= 0x04;
 
-    // bit3: ハンド中心軸
-    if(isCircle)
+    // bit3: ハンド開
+    if(isOpen)
         ret |= 0x08;
 
     // bit4: 呼び込み君
