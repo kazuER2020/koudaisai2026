@@ -64,8 +64,7 @@ PS3 Controller
 ├── motion_moving.wav
 ├── motion_arm.wav
 ├── hand_open.wav
-├── hand_close.wav
-└── yobikomikun.wav
+└── hand_close.wav
 ```
 
 ---
@@ -343,7 +342,7 @@ LPF
 
 # ハンド制御
 
-ハンドモータはタイマ割り込み内でソフトPWM制御している。
+ハンドモータはタイマ割り込み内でソフトPWM制御している。魂のGPIOを高速ON/OFF。
 
 ## 関連変数
 
@@ -375,7 +374,7 @@ RGB LEDでロボット状態を表示する。
 
 | 状態 | 色 |
 |--------|--------|
-| 呼び込み | 白 |
+| BGM | 白 |
 | 1段目 | 緑 |
 | 2段目 | 紫 |
 | ハンド開 | 青 |
@@ -394,32 +393,6 @@ toneSTM(4000, bpm, 0.07);
 ```
 
 電子音を2回鳴らす。
-
----
-
-## 呼び込みメロディ
-
-```cpp
-yobikomi_No4()
-```
-
-呼び込み君風メロディ。
-
----
-
-## ファミマ音
-
-実装済み。
-
-```cpp
-famima()
-```
-
-有効化する場合
-
-```cpp
-#define FAMIMA 1
-```
 
 ---
 
@@ -639,7 +612,7 @@ python3 koudaisai2026.py
 
 # キャリブレーション項目
 
-機体差が出やすいため、以下は現物合わせで調整すること。
+自動移動される位置をAD値で指定。現物合わせで調整する。
 
 ```cpp
 COALA_POSITION
@@ -677,7 +650,7 @@ ARM_UPPER_LIMIT
 ls /dev/ttyUSB*
 ```
 
-またシリアル設定が一致しているか確認する。
+シリアル設定が一致しているか確認する。
 
 ```python
 serial.Serial('/dev/ttyUSB0', 9600)
@@ -685,7 +658,7 @@ serial.Serial('/dev/ttyUSB0', 9600)
 
 ---
 
-# 製作者メモ
+# メモ
 
 ロボットの挙動を変更したい場合は以下を確認する。
 
