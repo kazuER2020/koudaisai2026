@@ -14,8 +14,8 @@ using namespace raven;
 #define ARM_UNDER_LIMIT 405 // アームの最下点
 #define ARM_UPPER_LIMIT 640 // アームの最上点
 
-#define HAND_RELEASE_SPEED  0.45f // ハンド開放強さ
-#define HAND_HOLD_SPEED     0.70f // ハンド保持強さ
+#define HAND_RELEASE_SPEED  0.80f // ハンド開放強さ
+#define HAND_HOLD_SPEED     0.80f // ハンド保持強さ
 
 /* PS3 joystick limits defination: */
 #define X_MAX 100
